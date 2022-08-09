@@ -11,10 +11,10 @@ by Shu Huang, Russell Golman, and Stephen B. Broomell.
 ## Algorithm
 1. The file "WeightingModels.R" contains the replication of previous common approaches to combine judgments including the theoretically optimal weighting method, several crowd selection method, our new parametric crowd selection method and the regularized weighting method with equal-weight prior. 
 2. The file "StackingAlgorithm.R" contains the stacking algorithm to combine all individual weighting models. We adopt the LASSO regression as the meta algorithm to select base learners. 
-3. The file "UsefulFunctions" contains other useful functions, such as the MSE calculation and plotting setting functions. 
-4. The file "data analysis_spf_frb.R" contains the sample code of analyzing the forecasting data from US SPF. 
-5. The file "data analysis_M4.R" contains the sample code of analyzing the M4 point forecasting data. 
-6. The file "data analysis_epidemic.R" contains the sample code of analyzing the epidemic forecasting data.
+3. The file "simulation_XXX.R" contains the sample code of generating simulated data and running the simulation. 
+4. The file "empirical_XXX.R" contains the sample code of analyzing real-world data. 
+5. The file "results_analysis.R" contains the sample code of result analysis after obtaining all simulation and empirical analysis results. 
+6. The file "correlation analysis.R" contains the sample code of calculating correlation involved in the working paper. 
 
 ## Data
 The raw data can be obtained by email authors. 
