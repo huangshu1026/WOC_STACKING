@@ -1,7 +1,6 @@
-####################################################################################
-########## This file includes all previous individual weighting models  ############
-########## including CWM, SS, TOPn, RP, OW, CLASSIC LASSO, RIDGE REGRESSION ########
-####################################################################################
+##################################################################################################
+########## This file includes all previous individual WOC models (i.e., base leaners) ############
+##################################################################################################
 
 ########## Input: (X, y) ###########
 ########## Output: weights #########
@@ -16,6 +15,706 @@ if (!require('quadprog')) install.packages('quadprog'); library('quadprog')
 if (!require('readr')) install.packages('readr'); library('readr')
 if (!require('tseries')) install.packages('tseries'); library('tseries')
 if (!require('PACLasso')) install.packages('PACLasso'); library('PACLasso')
+
+##########################################
+########## Simple Approaches #############
+##########################################
+###### Simple Average (SA) ######
+eqw <- function(X, y){
+  M <- ncol(X)
+  weight <- rep(1/M, M)
+  return(weight)
+}
+
+###################################################
+######### All-crowd weighting methods #############
+###################################################
+###### Optimal weighting ######
+## Davis-Stover (2014, 2015)
+optw_bias <- function(X, y){
+  mu.obs <- colMeans(X) - mean(y)
+  sigma.obs <- cov(X)
+  mat <- sigma.obs + mu.obs%*%t(mu.obs)
+  sigma.xy <- cov(X, y)
+  A <- t(rep(1, ncol(X)))
+  QPmodel <- solve.QP(Dmat = nearPD(mat)$mat, 
+                      dvec = sigma.xy, 
+                      Amat = t(A), 
+                      bvec = c(1), 
+                      meq = 1) 
+  weight <- QPmodel$solution
+  return(weight)
+}
+## Winkler (1986): require debias
+optw_cov <- function(X, y){
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  sigma <- cov(X.new)
+  sigma <- nearPD(sigma)$mat
+  weight <- colSums(solve(sigma))/sum(solve(sigma))
+  return(list(weight = weight, bias = mu.obs))
+}
+## Bunn (1985): require debias
+optw_var <- function(X, y){
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  sigma <- diag(apply(X.new, 2, var))
+  sigma <- nearPD(sigma)$mat
+  weight <- colSums(solve(sigma))/sum(solve(sigma))
+  return(list(weight = weight, bias = mu.obs))
+}
+## Soule et al., (2020): require debias
+Calweight_rho_c <- function(rho_c, sd_vec){
+  k <- length(sd_vec)
+  cor.mat <- matrix(rep(rho_c, k*k), k, k)
+  diag(cor.mat) <- 1
+  sigma <- cor2cov(cor.mat, sd_vec)
+  sigma <- nearPD(sigma)$mat 
+  weight <- colSums(solve(sigma))/sum(solve(sigma))
+  return(weight)
+}
+optw_var_1cor_exo <- function(X, y){
+  # obtain unbiased judgments 
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  # model
+  k <- ncol(X.new)
+  sd_vec <- apply(X.new, 2, sd)
+  if(length(which(sd_vec <= 0)) > 0){
+    sd_vec[which(sd_vec <= 0)] <- min(sd_vec[which(sd_vec > 0)])*0.001
+  }
+  rho_c_seq <- seq(1/(1-k)+0.001, 0.999, length.out = 1000)
+  Weights <- c()
+  for(i in 1:length(rho_c_seq)){
+    tempdata <- Calweight_rho_c(rho_c_seq[i], sd_vec)
+    Weights <- rbind(Weights, tempdata)
+  }
+  error_MSE <- colMeans((X.new %*% t(Weights) - y)^2)
+  best_rho_c <- rho_c_seq[which.min(error_MSE)]
+  weight <- Calweight_rho_c(best_rho_c, sd_vec)
+  return(list(rho_c = best_rho_c, weight = weight, bias = mu.obs))
+}
+optw_var_1cor_BayesMean <- function(X, y){
+  # obtain unbiased judgments 
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  # model
+  k <- ncol(X.new)
+  delta0 <- k + 1
+  rho_c_0 <- 0
+  sd_vec <- apply(X.new, 2, sd)
+  if(length(which(sd_vec <= 0)) > 0){
+    sd_vec[which(sd_vec <= 0)] <- min(sd_vec[which(sd_vec > 0)])*0.001
+  }
+  cor_mat <- cor(X.new)
+  if(length(which(is.na(cor_mat) == TRUE)) > 0){
+    k.na <- length(which(is.na(cor_mat) == TRUE))
+    rho_bar <- (sum(na.omit(cor_mat)) - k)/(k*(k-1) - k.na)
+  } else {
+    rho_bar <- (sum(cor_mat)-k)/(k*(k-1))
+  }
+  rho_c <- ((delta0-k-1)*rho_c_0 + n*rho_bar) / (delta0+n-k-1)
+  weight <- Calweight_rho_c(rho_c, sd_vec)
+  return(list(rho_c = rho_c, weight = weight, bias = mu.obs))
+}
+optw_var_1cor_BayesMAP <- function(X, y){
+  # obtain unbiased judgments 
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  # model 
+  k <- ncol(X.new)
+  delta0 <- k + 1
+  rho_c_0 <- 0
+  sd_vec <- apply(X.new, 2, sd)
+  if(length(which(sd_vec <= 0)) > 0){
+    sd_vec[which(sd_vec <= 0)] <- min(sd_vec[which(sd_vec > 0)])*0.001
+  }
+  cor_mat <- cor(X.new)
+  if(length(which(is.na(cor_mat) == TRUE)) > 0){
+    k.na <- length(which(is.na(cor_mat) == TRUE))
+    rho_bar <- (sum(na.omit(cor_mat)) - k)/(k*(k-1) - k.na)
+  } else {
+    rho_bar <- (sum(cor_mat)-k)/(k*(k-1))
+  }
+  rho_c <- ((delta0-k-1)*rho_c_0 + n*rho_bar) / (delta0+n+k+2)
+  weight <- Calweight_rho_c(rho_c, sd_vec)
+  return(list(rho_c = rho_c, weight = weight, bias = mu.obs))
+}
+optw_var_1cor_mean <- function(X, y){
+  # obtain unbiased judgments 
+  n <- nrow(X)
+  mu.obs <- colMeans(X - y)
+  debias.mat <- matrix(rep(mu.obs, each = n), ncol = ncol(X), nrow = nrow(X))
+  X.new <- X - debias.mat
+  # model 
+  k <- ncol(X.new)
+  sd_vec <- apply(X.new, 2, sd)
+  if(length(which(sd_vec <= 0)) > 0){
+    sd_vec[which(sd_vec <= 0)] <- min(sd_vec[which(sd_vec > 0)])*0.001
+  }
+  cor_mat <- cor(X.new)
+  if(length(which(is.na(cor_mat) == TRUE)) > 0){
+    k.na <- length(which(is.na(cor_mat) == TRUE))
+    rho_c <- (sum(na.omit(cor_mat)) - k)/(k*(k-1) - k.na)
+  } else {
+    rho_c <- (sum(cor_mat)-k)/(k*(k-1))
+  }
+  weight <- Calweight_rho_c(rho_c, sd_vec)
+  return(list(rho_c = rho_c, weight = weight, bias = mu.obs))
+}
+
+###### Regularized weighting ######
+ConsLas <- function(X, y){
+  M <- ncol(X)
+  w.prime <- rep(1/M, M)
+  y.new <- y - X %*% w.prime
+  model <- ConsLasso_eq(X, y.new, C.full = t(rep(1, M)), b = 0, l.min = -3, l.max = 6, step = 0.1, intercept = F)
+  # select the best lambda 
+  error_MSE <- colMeans((X %*% (model$coefs + w.prime) - y)^2)
+  #best.labmda <- model$lambda[which.min(error_MSE)] 
+  weight <- model$coefs[ , which.min(error_MSE)] + w.prime
+  return(weight)
+}
+ConsRidge <- function(X, y){
+  M <- ncol(X)
+  w.prime <- rep(1/M, M)
+  y.new <- y - X %*% w.prime
+  w <- ConstrRidge_sum0(X, y.new)
+  weight <- w + w.prime
+  return(weight)
+}
+ConstrRidge_sum0 <- function(X, y, l.min = -3, l.max = 6, step = 0.1){
+  l2.seq <- 10^seq(l.min, l.max, by = step)
+  bestl2 <- NA
+  M <- ncol(X)
+  n <- nrow(X)
+  XTX <- t(X) %*% X
+  XTY <- t(X) %*% y
+  
+  gcv <- sapply(1:length(l2.seq), function(i) CalGCV.ridge_sum0(X, y, l2.seq[i]))
+  if(all(is.na(gcv) == TRUE)){
+    l2.seq.new <- 10^seq(l.min-3, l.min, by = 0.1)
+    gcv <- sapply(1:length(l2.seq.new), function(i) CalGCV.ridge_sum0(X, y, l2.seq.new[i]))
+    if(all(is.na(gcv) == TRUE)){
+      bestl2 <- 0
+    } else {
+      bestl2 <- l2.seq.new[which.min(gcv)]
+    }
+  } else {
+    bestl2 <- l2.seq[which.min(gcv)]
+  }
+  H <- cbind(XTX + bestl2*diag(M))
+  f <- XTY
+  # equalities
+  A.eq <- rbind(rep(1, M))
+  b.eq <- c(0)
+  results <- solve.QP(Dmat = H, dvec = f, Amat = t(rbind(A.eq)), bvec = c(b.eq), meq = 1)
+  weights <- results$solution
+  return(weights)
+}
+CalGCV.ridge_sum0 <- function(X, y, lambda2){
+  ## gamma = 2
+  M <- ncol(X)
+  n <- nrow(X)
+  XTX <- t(X) %*% X
+  XTY <- t(X) %*% y
+  ## step 1: calculate beta hat
+  H <- cbind(XTX + lambda2*diag(M))
+  f <- XTY
+  # equalities
+  A.eq <- rbind(rep(1, M))
+  b.eq <- c(0)
+  GCV <- NA
+  tryCatch({
+    results <- solve.QP(Dmat = H, dvec = f, Amat = t(rbind(A.eq)), bvec = c(b.eq), meq = 1)
+    weights <- results$solution
+    ## step 2: p(lambda2)
+    B <- X %*% solve(t(X)%*%X + lambda2*diag(M)) %*% t(X)
+    plambda <- sum(diag(B))
+    ## step 3: GCV
+    GCV <- (t(y-X%*%weights) %*% (y-X%*%weights))/(n * (1 - plambda/n)^2)
+  }, error = function(e){
+    NULL
+  })
+  return(GCV)
+}
+ConsLasso_ineq <- function (x, y, C.full, b, l.min = -2, l.max = 6, step = 0.2, 
+                            beta0 = NULL, verbose = F, max.it = 12, intercept = T, normalize = T, 
+                            backwards = F){
+  if (!backwards) {
+    fit = ConsLars_ineq(x, y, C.full, b, l.min = l.min, l.max = l.max, 
+                        step = step, beta0 = beta0, verbose = verbose, max.it = max.it, 
+                        intercept = intercept, normalize = normalize, forwards = T)
+    if (fit$error | is.null(fit$coefs)) {
+      if (is.null(fit$lambda)) 
+        fit$lambda = 10^l.min
+      fit2 = ConsLars_ineq(x, y, C.full, b, l.min = log10(max(fit$lambda)), 
+                           l.max = l.max, step = step, beta0 = beta0, verbose = verbose, 
+                           max.it = max.it, intercept = intercept, normalize = normalize, 
+                           forwards = F)
+      if (is.null(fit$coefs)) 
+        fit$lambda = NULL
+      fit$coefs = cbind(fit$coefs, fit2$coefs)
+      fit$lambda = c(fit$lambda, fit2$lambda)
+      fit$intercept = c(fit$intercept, fit$intercept)
+    }
+  }
+  else fit = ConsLars_ineq(x, y, C.full, b, l.min = l.min, l.max = l.max, 
+                           step = step, beta0 = beta0, verbose = verbose, max.it = max.it, 
+                           intercept = intercept, normalize = normalize, forwards = F)
+  fit
+}
+ConsLars_ineq <- function (x, y, C.full, b, l.min = -2, l.max = 6, step = 0.2, 
+                           beta0 = NULL, verbose = F, max.it = 12, intercept = T, normalize = T, 
+                           forwards = T){
+  p = ncol(x)
+  n = nrow(x)
+  M = nrow(C.full)
+  one <- rep(1, n)
+  if (intercept) {
+    meanx <- drop(one %*% x)/n
+    x <- scale(x, meanx, FALSE)
+    mu <- mean(y)
+    y <- drop(y - mu)
+  }
+  else {
+    meanx <- rep(0, p)
+    mu <- 0
+    y <- drop(y)
+  }
+  normx <- rep(1, p)
+  if (normalize) {
+    normx <- sqrt(n) * apply(x, 2, stats::sd, na.rm = T)
+    x <- scale(x, FALSE, normx)
+  }
+  C.full = t(t(C.full)/normx)
+  if (!forwards) {
+    lambda = lambda.old = 10^l.max
+    step = -step
+    if (is.null(beta0)) 
+      beta0 = lin.int.ineq(C.full, b)
+  }
+  else {
+    lambda = lambda.old = 10^l.min
+    if (is.null(beta0)) 
+      beta0 = quad.int.ineq(x, y, C.full, b, lambda)
+  }
+  A.old = C.full
+  x.old = x
+  C.full = cbind(C.full, -diag(M))
+  x = cbind(x, matrix(0, n, M))
+  p = p + M
+  beta.new = rep(0, p)
+  step.orig = step
+  coefs = grid = b2index = NULL
+  t.data = transformed.ineq(x, y, C.full, b, lambda, beta0)
+  beta1.old = t.data$beta1
+  beta2.old = t.data$beta2
+  iterations = 1
+  end.loop = F
+  while (!end.loop & (iterations <= max.it)) {
+    iterations = 1
+    loop = T
+    while (loop & (iterations <= max.it)) {
+      t.data$y = t.data$y + (lambda - lambda.old) * t.data$C
+      beta1.new = rep(0, length(beta1.old))
+      act = length(t.data$active)
+      lambda.pen = rep(lambda, act)
+      lambda.pen[t.data$delta1.index] = 0
+      positive.pen = rep(F, act)
+      if (act > p) {
+        positive.pen[t.data$delta1.index] = T
+      }
+      fit.pen = Penalized_update(t.data$y, t.data$x[ ,
+                                                     t.data$active], ~0, lambda1 = lambda.pen, lambda2 = 0.001, trace = F, positive = positive.pen, 
+                                 maxiter = 10000, startbeta = beta1.old, epsilon = 10^-6)
+      beta1.new[t.data$active] = coef(fit.pen, "all")
+      # if (!attr(fit.pen, "converged")) 
+      #   print(paste("Warning: Maximum iterations exceeded in penalized fit."))
+      beta2.new = beta2.old + t.data$a2 %*% (beta1.old - 
+                                               beta1.new)
+      bad.beta2 = (sum(abs(sign(t.data$beta2) - sign(beta2.new))) != 
+                     0)
+      X_star = t.data$x
+      derivs = abs(as.vector(t(X_star) %*% (X_star %*% 
+                                              beta1.new)) - t(X_star) %*% t.data$Y_star - 
+                     lambda * t.data$C2)
+      bad.active = F
+      if (n < (p - M)) 
+        bad.active = (max(derivs[-t.data$active]) > 
+                        lambda)
+      if (bad.beta2 | bad.active) {
+        t.data$y = t.data$y - (lambda - lambda.old) * 
+          t.data$C
+        step = step/2
+        lambda = lambda.old * 10^step
+        iterations = iterations + 1
+      }
+      else loop = F
+    }
+    if (iterations <= max.it) {
+      # if (verbose == T) {
+      #   print(paste("Lambda =", round(lambda, 3)))
+      #   if (abs(step) < abs(step.orig)) 
+      #     print(paste("Step size reduced to ", step))
+      # }
+      step = step.orig
+      beta.new[t.data$beta2.index] = beta2.new
+      beta.new[-t.data$beta2.index] = beta1.new
+      coefs = cbind(coefs, beta.new)
+      change.beta = (min(abs(beta2.new)) < max(abs(beta1.new)))
+      change.active = F
+      if (n < (p - M)) 
+        change.active = (min(derivs[t.data$active]) < 
+                           max(derivs[-t.data$active]))
+      if (change.beta | change.active) {
+        t.data = transformed.ineq(x, y, C.full, b, lambda, 
+                                  beta.new)
+        beta1.new = t.data$beta1
+        beta2.new = t.data$beta2
+      }
+      beta1.old = beta1.new
+      beta2.old = beta2.new
+      grid = c(grid, lambda)
+      lambda.old = lambda
+      lambda = lambda * 10^step
+    }
+    if ((forwards & (lambda > 10^l.max)) | (!forwards & 
+                                            (lambda < 10^l.min))) 
+      end.loop = T
+  }
+  # if (iterations > max.it) 
+  # print("Exceed.")
+  # print(paste("Warning: Algorithm terminated at lambda =", 
+  #             round(lambda.old, 1), ": Maximum iterations exceeded."))
+  colnames(coefs) = intercept = NULL
+  if (!is.null(grid)) {
+    normx = c(normx, rep(1, M))
+    coefs = coefs/normx
+    coefs = coefs[, order(grid)]
+    grid = sort(grid)
+    meanx = c(meanx, rep(0, M))
+    intercept = mu - drop(t(coefs) %*% meanx)
+  }
+  coefs = coefs[1:(p - M), ]
+  list(coefs = coefs, lambda = grid, intercept = intercept, 
+       error = (iterations > max.it))
+}
+Penalized_update <- function (response, penalized, unpenalized, lambda1 = 0, lambda2 = 0, 
+                              positive = FALSE, data, fusedl = FALSE, model = c("cox", "logistic", "linear", "poisson"), startbeta, startgamma, 
+                              steps = 1, epsilon = 1e-10, maxiter, standardize = FALSE, 
+                              trace = TRUE){
+  if (missing(maxiter)) 
+    maxiter <- if (lambda1 == 0 && lambda2 == 0 && !positive) 
+      25
+  else Inf
+  if (steps == "Park" || steps == "park") {
+    steps <- 1
+    park <- TRUE
+  }
+  else park <- FALSE
+  prep <- penalized:::.checkinput(match.call(), parent.frame())
+  if (ncol(prep$X) >= nrow(prep$X) && all(lambda1 == 0) && 
+      all(lambda2 == 0) && !any(prep$positive)) 
+    stop("High-dimensional data require a penalized model. Please supply lambda1 or lambda2.", 
+         call. = FALSE)
+  fit <- penalized:::.modelswitch(prep$model, prep$response, prep$offset, 
+                                  prep$strata)$fit
+  pu <- length(prep$nullgamma)
+  pp <- ncol(prep$X) - pu
+  n <- nrow(prep$X)
+  nr <- nrow(prep$X)
+  fusedl <- prep$fusedl
+  if (length(lambda1) == pp && (!all(lambda1 == 0))) {
+    wl1 <- c(numeric(pu), lambda1)
+    lambda1 <- 1
+  }
+  else {
+    wl1 <- 1
+  }
+  if (length(lambda2) == pp) 
+    lambda2 <- c(numeric(pu), lambda2)
+  if (park || steps > 1 && fusedl == FALSE) {
+    if (pu > 0) 
+      lp <- drop(prep$X[, 1:pu, drop = FALSE] %*% prep$nullgamma)
+    else lp <- numeric(n)
+    chck <- (wl1 > 0) & c(rep(FALSE, pu), rep(TRUE, pp))
+    gradient <- drop(crossprod(prep$X[, chck, drop = FALSE], 
+                               fit(lp)$residuals))
+    if (length(wl1) > 1) {
+      rel <- gradient/(wl1[chck] * prep$baselambda1[chck])
+    }
+    else {
+      rel <- gradient/(wl1 * prep$baselambda1[chck])
+    }
+    from <- max(ifelse(prep$positive[chck], rel, abs(rel)))
+    if (from < lambda1) {
+      warning("Chosen lambda1 greater than maximal lambda1: \"steps\" argument ignored")
+      steps <- 1
+      park <- FALSE
+      from <- lambda1
+    }
+  }
+  else {
+    from <- lambda1
+  }
+  lambda1s <- sapply(1:length(lambda1), function(x) seq(from[x], lambda1[x], length.out = steps))
+  beta <- prep$beta
+  louts <- if (park) 
+    4 * pp
+  else length(lambda1s)
+  outs <- vector("list", louts)
+  rellambda1 <- lambda1s[1]
+  ready <- FALSE
+  i <- 0
+  while (!ready) {
+    ready <- all(rellambda1 == lambda1)
+    i <- i + 1
+    if (!fusedl) {
+      if (rellambda1 != 0 || any(prep$positive)) {
+        if (all(lambda2 == 0)) {
+          out <- penalized:::.steplasso(beta = beta, lambda = rellambda1 * 
+                                          wl1 * prep$baselambda1, lambda2 = 0, positive = prep$positive, 
+                                        X = prep$X, fit = fit, trace = trace, epsilon = epsilon, 
+                                        maxiter = maxiter)
+        }
+        else {
+          out <- penalized:::.lasso(beta = beta, lambda = rellambda1 * 
+                                      wl1 * prep$baselambda1, lambda2 = lambda2 * 
+                                      prep$baselambda2, positive = prep$positive, 
+                                    X = prep$X, fit = fit, trace = trace, epsilon = epsilon, 
+                                    maxiter = maxiter)
+        }
+      }
+      else {
+        if (pp > n) {
+          P <- penalized:::.makeP(prep$X, lambda2 * prep$baselambda2)
+          gams <- .solve(crossprod(t(P)), P %*% beta)
+          PX <- P %*% t(prep$X)
+          Pl <- P * matrix(sqrt(lambda2 * prep$baselambda2), 
+                           nrow(P), ncol(P), byrow = TRUE)
+          PlP <- crossprod(t(Pl))
+          out <- penalized:::.ridge(beta = gams, Lambda = PlP, X = t(PX), 
+                                    fit = fit, trace = trace, epsilon = epsilon, 
+                                    maxiter = maxiter)
+          out$beta <- drop(crossprod(P, out$beta))
+        }
+        else {
+          out <- penalized:::.ridge(beta = beta, Lambda = lambda2 * 
+                                      prep$baselambda2, X = prep$X, fit = fit, 
+                                    trace = trace, epsilon = epsilon, maxiter = maxiter)
+        }
+      }
+    }
+    if (fusedl) {
+      out <- penalized:::.flasso(beta = beta, lambda1 = rellambda1 * 
+                                   wl1 * prep$baselambda1, lambda2 = lambda2 * 
+                                   prep$baselambda2, chr = prep$chr, positive = prep$positive, 
+                                 X = prep$X, fit = fit, trace = trace, epsilon = epsilon, 
+                                 maxiter = maxiter)
+    }
+    if (trace) 
+      cat("\n")
+    beta <- out$beta
+    if (!ready) {
+      if (!fusedl) {
+        if (park) {
+          newpark <- penalized:::.park(beta = beta, lambda = rellambda1 * 
+                                         wl1 * prep$baselambda1, lambda2 = 0, positive = prep$positive, 
+                                       X = prep$X, fit = out$fit)
+          rellambda1 <- rellambda1 * (1 - newpark$hh)
+          if (rellambda1 < lambda1 || rellambda1 == 
+              Inf) {
+            rellambda1 <- lambda1
+            beta <- out$beta
+          }
+          else {
+            beta <- newpark$beta
+          }
+          lambda1s <- c(lambda1s, rellambda1)
+        }
+        else {
+          rellambda1 <- lambda1s[i + 1]
+          beta <- out$beta
+        }
+      }
+      else {
+        rellambda1 <- lambda1s[i + 1]
+        beta <- out$beta
+      }
+    }
+    outs[[i]] <- out
+  }
+  if (length(lambda2) > 1) 
+    lambda2 <- lambda2[pu + 1:pp]
+  outs <- sapply(1:i, function(nr) {
+    thislambda1 <- lambda1s[[nr]] * ifelse(length(wl1) > 
+                                             1, wl1[pu + 1:pp], wl1)
+    penalized:::.makepenfit(outs[[nr]], pu, fusedl = fusedl, prep$model, 
+                            thislambda1, lambda2, prep$orthogonalizer, prep$weights, 
+                            prep$formula, rownames(prep$X))
+  })
+  if (length(outs) == 1) 
+    outs <- outs[[1]]
+  outs
+}
+ConsLasso_eq <- function (x, y, C.full, b, l.min = -2, l.max = 6, step = 0.2, 
+            beta0 = NULL, verbose = F, max.it = 12, intercept = T, normalize = T, 
+            backwards = F){
+    if (!backwards) {
+      fit = ConsLars_eq(x, y, C.full, b, l.min = l.min, l.max = l.max, 
+                        step = step, beta0 = beta0, verbose = verbose, max.it = max.it, 
+                        intercept = intercept, normalize = normalize, forwards = T)
+      if (fit$error | is.null(fit$coefs)) {
+        if (is.null(fit$lambda)) 
+          fit$lambda = 10^l.min
+        fit2 = ConsLars_eq(x, y, C.full, b, l.min = log10(max(fit$lambda)), 
+                           l.max = l.max, step = step, beta0 = beta0, verbose = verbose, 
+                           max.it = max.it, intercept = intercept, normalize = normalize, 
+                           forwards = F)
+        if (is.null(fit$coefs)) 
+          fit$lambda = NULL
+        fit$coefs = cbind(fit$coefs, fit2$coefs)
+        fit$lambda = c(fit$lambda, fit2$lambda)
+        fit$intercept = c(fit$intercept, fit2$intercept)
+        fit$b2index = cbind(fit$b2index, fit2$b2index)
+      }
+    }
+    else fit = ConsLars_eq(x, y, C.full, b, l.min = l.min, l.max = l.max, 
+                           step = step, beta0 = beta0, verbose = verbose, max.it = max.it, 
+                           intercept = intercept, normalize = normalize, forwards = F)
+    fit
+  }
+ConsLars_eq <- function (x, y, C.full, b, l.min = -2, l.max = 6, step = 0.2, 
+                         beta0 = NULL, verbose = F, max.it = 12, intercept = T, normalize = T, 
+                         forwards = T){
+  p = ncol(x)
+  n = nrow(x)
+  m = nrow(C.full)
+  beta.new = rep(0, p)
+  one <- rep(1, n)
+  if (intercept) {
+    meanx <- drop(one %*% x)/n
+    x <- scale(x, meanx, FALSE)
+    mu <- mean(y)
+    y <- drop(y - mu)
+  }
+  else {
+    meanx <- rep(0, p)
+    mu <- 0
+    y <- drop(y)
+  }
+  normx <- rep(1, p)
+  if (normalize) {
+    normx <- sqrt(n) * apply(x, 2, stats::sd, na.rm = T)
+    x <- scale(x, FALSE, normx)
+  }
+  C.full = t(t(C.full)/normx)
+  if (!forwards) {
+    lambda = lambda.old = 10^l.max
+    step = -step
+    if (is.null(beta0)) 
+      beta0 = lin.int(C.full, b)
+  }
+  else {
+    lambda = lambda.old = 10^l.min
+    if (is.null(beta0)) 
+      beta0 = quad.int(x, y, C.full, b, lambda)
+  }
+  step.orig = step
+  coefs = grid = b2index = NULL
+  t.data = transformed(x, y, C.full, b, lambda, beta0)
+  beta1.old = t.data$beta1
+  beta2.old = t.data$beta2
+  iterations = 1
+  end.loop = F
+  while (!end.loop & (iterations <= max.it)) {
+    iterations = 1
+    loop = T
+    while (loop & (iterations <= max.it)) {
+      t.data$y = t.data$y + (lambda - lambda.old) * t.data$C
+      beta1.new = rep(0, length(beta1.old))
+      fit = lars::lars(t.data$x[, t.data$active], t.data$y, 
+                       normalize = F, intercept = F)
+      beta1.new[t.data$active] = stats::predict(fit, s = lambda, 
+                                                type = "coefficients", mode = "lambda")$coef
+      beta2.new = beta2.old + t.data$a2 %*% (beta1.old - 
+                                               beta1.new)
+      bad.beta2 = (sum(abs(sign(t.data$beta2) - sign(beta2.new))) != 
+                     0)
+      X_star = t.data$x
+      derivs = abs(as.vector(t(X_star) %*% (X_star %*% 
+                                              beta1.new)) - t(X_star) %*% t.data$Y_star - 
+                     lambda * t.data$C2)
+      bad.active = F
+      if (n < (p - m)) 
+        bad.active = (max(derivs[-t.data$active]) > 
+                        lambda)
+      if (bad.beta2 | bad.active) {
+        t.data$y = t.data$y - (lambda - lambda.old) * 
+          t.data$C
+        step = step/2
+        lambda = lambda.old * 10^step
+        iterations = iterations + 1
+      }
+      else loop = F
+    }
+    if (iterations <= max.it) {
+      # if (verbose == T) {
+      #   print(paste("Lambda =", round(lambda, 3)))
+      #   if (abs(step) < abs(step.orig)) 
+      #     print(paste("Step size reduced to ", step))
+      # }
+      step = step.orig
+      beta.new[t.data$beta2.index] = beta2.new
+      beta.new[-t.data$beta2.index] = beta1.new
+      coefs = cbind(coefs, beta.new)
+      b2index = cbind(b2index, t.data$beta2.index)
+      change.beta = (min(abs(beta2.new)) < max(abs(beta1.new)))
+      change.active = F
+      if (n < (p - m)) 
+        change.active = (min(derivs[t.data$active]) < 
+                           max(derivs[-t.data$active]))
+      if (change.beta | change.active) {
+        t.data = transformed(x, y, C.full, b, lambda, 
+                             beta.new)
+        beta1.new = t.data$beta1
+        beta2.new = t.data$beta2
+      }
+      beta1.old = beta1.new
+      beta2.old = beta2.new
+      grid = c(grid, lambda)
+      lambda.old = lambda
+      lambda = lambda * 10^step
+    }
+    if ((forwards & (lambda > 10^l.max)) | (!forwards & 
+                                            (lambda < 10^l.min))) 
+      end.loop = T
+  }
+  # if (iterations > max.it) 
+  #   print(paste("Warning: Algorithm terminated at lambda =", 
+  #               round(lambda.old, 1), ": Maximum iterations exceeded."))
+  colnames(coefs) = intercept = NULL
+  if (!is.null(grid)) {
+    coefs = coefs/normx
+    coefs = coefs[, order(grid)]
+    b2index = b2index[, order(grid)]
+    grid = sort(grid)
+    intercept = mu - drop(t(coefs) %*% meanx)
+  }
+  list(coefs = coefs, lambda = grid, intercept = intercept, 
+       error = (iterations > max.it), b2index = b2index)
+}
 
 #################################################
 ########## Crowds Selection Methods #############
@@ -92,18 +791,6 @@ SeqSearch <- function(X, y){
   
   return(list(weight.SSIN = SSin.weight, weight.SSDE = SSde.weight))
 }
-###### Top N Models ######
-TopNModel <- function(X, y, N){
-  # set-up
-  M <- ncol(X)
-  # selecting the top N model
-  MSE.train.AllModel <- sapply(1:M, function(i) mean((X[ , i] - y)^2))
-  MSEranking <- rank(MSE.train.AllModel, ties.method = "random")
-  choose <- which(MSEranking <= N)
-  weight <- rep(0, M)
-  weight[choose] <- 1/length(choose)
-  return(weight)
-} 
 ###### Rank Performance ######
 RankPerformance <- function(X, y){
   # set-up
@@ -118,478 +805,38 @@ RankPerformance <- function(X, y){
   weight[RANK.select] <- 1/length(RANK.select)
   return(weight)
 } # only return the selected model's index 
-###### ApproxGOpt ######
-PermuteMatrix <- function(rank, Sigma, mux, sigmaxy){
-  M <- length(mux)
-  ##### step1: permute the matrix: Sigma + mux %*% t(mux) #####
-  mat <- Sigma + mux %*% t(mux)
-  index.order <- c()
-  summation <- c()
-  upperbound <- c()
-  lowerbound <- c()
-  upperbound[1] <- -2 * min(sigmaxy)
-  lowerbound[1] <- -2 * max(sigmaxy)
-  
-  # row 1
-  index.order[1] <- rank
-  summation[1] <- diag(mat)[rank]
-  upperbound[2] <- -2 * min(sigmaxy[-index.order])
-  lowerbound[2] <- -2 * max(sigmaxy[-index.order])
-  # row 2
-  addition <- diag(mat) + 2 * mat[index.order, ]
-  addition[index.order] <- 1000000000
-  index.order[2] <- which.min(addition)
-  summation[2] <- summation[1] + min(addition)
-  upperbound[3] <- -2 * min(sigmaxy[-index.order])
-  lowerbound[3] <- -2 * max(sigmaxy[-index.order])
-  # row 3 to M-1
-  for(i in 3:(M-1)){
-    addition <- diag(mat) + 2 * colSums(mat[index.order, ])
-    addition[index.order] <- 1000000000
-    index.order[i] <- which.min(addition)
-    summation[i] <- summation[i-1] + min(addition)
-    upperbound[i+1] <- -2 * min(sigmaxy[-index.order])
-    lowerbound[i+1] <- -2 * max(sigmaxy[-index.order])
-  }
-  # row M
-  index.order[M] <- c(1:M)[-index.order]
-  summation[M] <- sum(mat)
-  diff.crit <- upperbound - lowerbound # ith element for ith person being selected 
-  return(list(index.order = index.order, summation = summation, diff.crit = diff.crit))
-} # return the index.order, summation, and diff.crit
-ApproxGopt <- function(X, y){
+###### Top N Models ######
+TopNModel <- function(X, y, N){
+  # set-up
   M <- ncol(X)
-  Sigma <- cov(X)
-  mux <- colMeans(X - matrix(rep(y, M), nrow = length(y), ncol = M))
-  sigmaxy <- cor(X, y)*sqrt(diag(Sigma))*sd(y)
-  sigma2y <- var(y)
-  mat <- Sigma + mux %*% t(mux)
-  #index.order.mat <- matrix(0, nrow = M, ncol = M) # each row is for each person 
-  #summation.mat <- matrix(0, nrow = M, ncol = M)
-  #diff.crit.mat <- matrix(0, nrow = M, ncol = M)
-  MSE <- 100000
-  SELECT <- c()
-  for(m in 1:M){
-    ##### step1: permute the matrix: Sigma + mux %*% t(mux) for each person being the first row #####
-    permute <- PermuteMatrix(m, Sigma, mux, sigmaxy)
-    index.order <- permute$index.order
-    summation <- permute$summation
-    diff.crit <- permute$diff.crit
-    ##### step2: select crowds when first term is dominant ##### 
-    select <- c()
-    select[1] <- index.order[1]
-    for(i in 2:M){ # adding ith person
-      diff <- summation[i-1]/((i-1)^2) - summation[i]/(i^2)
-      if(diff >= diff.crit[i]){
-        select[i] <- index.order[i]
-      } else {
-        break
-      }
-    } # leave select to step 3
-    ##### step3: adding one by one by considering all terms #####
-    num <- length(select)
-    if(num == 1){
-      existnum <- length(select)
-      candidates <- c(1:M)[-select]
-      oldmse.term1 <- sum(mat[select, select])
-      oldmse <- oldmse.term1/(existnum^2) - 2*sum(sigmaxy[select])/existnum
-      tempmse <- (oldmse.term1 + diag(mat)[candidates] + 2 * mat[select, candidates])/((existnum+1)^2) - 2*(sum(sigmaxy[select]) + sigmaxy[candidates])/(existnum+1)
-      reduction <- oldmse - tempmse
-      if(max(reduction) > 0){
-        select <- c(select, candidates[which.max(reduction)])
-        for(j in (num + 2):(M-1)){
-          existnum <- length(select)
-          candidates <- c(1:M)[-select]
-          oldmse.term1 <- sum(mat[select, select])
-          oldmse <- oldmse.term1/(existnum^2) - 2*sum(sigmaxy[select])/existnum
-          tempmse <- (oldmse.term1 + diag(mat)[candidates] + 2 * colSums(mat[select, candidates]))/((existnum+1)^2) - 2*(sum(sigmaxy[select]) + sigmaxy[candidates])/(existnum+1)
-          reduction <- oldmse - tempmse
-          if(max(reduction) > 0){
-            select <- c(select, candidates[which.max(reduction)])
-          } else {
-            break
-          }
-        }
-        MSE.new <- sum(mat[select, select])/(length(select)^2) - 2*sum(sigmaxy[select])/(length(select))
-        if(MSE.new < MSE){
-          SELECT <- select
-          MSE <- MSE.new
-        }
-      } else {
-        MSE.new <- sum(mat[select, select])/(length(select)^2) - 2*sum(sigmaxy[select])/(length(select))
-        if(MSE.new < MSE){
-          SELECT <- select
-          MSE <- MSE.new
-        }
-      }
-    } else {
-      for(j in (num + 1):(M-1)){
-        existnum <- length(select)
-        candidates <- c(1:M)[-select]
-        oldmse.term1 <- sum(mat[select, select])
-        oldmse <- oldmse.term1/(existnum^2) - 2*sum(sigmaxy[select])/existnum
-        tempmse <- (oldmse.term1 + diag(mat)[candidates] + 2 * colSums(mat[select, candidates]))/((existnum+1)^2) - 2*(sum(sigmaxy[select]) + sigmaxy[candidates])/(existnum+1)
-        reduction <- oldmse - tempmse
-        if(max(reduction) > 0){
-          select <- c(select, candidates[which.max(reduction)])
-        } else {
-          break
-        }
-      }
-      MSE.new <- sum(mat[select, select])/(length(select)^2) - 2*sum(sigmaxy[select])/(length(select))
-      if(MSE.new < MSE){
-        SELECT <- select
-        MSE <- MSE.new
-      }
-    }
-  }
+  # selecting the top N model
+  MSE.train.AllModel <- sapply(1:M, function(i) mean((X[ , i] - y)^2))
+  MSEranking <- rank(MSE.train.AllModel, ties.method = "random")
+  choose <- which(MSEranking <= N)
   weight <- rep(0, M)
-  weight[SELECT] <- 1/length(SELECT)
+  weight[choose] <- 1/length(choose)
   return(weight)
-} # for M >= 3
-
+} 
 
 #################################################
-####### Theoretical True Optimal Weights#########
+########## Vanilla Stacking Method  #############
 #################################################
-###### Optimal weights: with sum to one & non-negative constraints ######
-optw <- function(X, y){
-  M <- ncol(X)
-  mat <- t(X) %*% X
-  if(!is.positive.definite(mat)){
-    mat <- nearPD(mat)$mat
-  } # change the optimal weights 
-  Rinv <- solve(chol(mat))
-  C <- cbind(rep(1, M), diag(M))
-  b <- c(1, rep(0, M))
-  d <- t(y) %*% X
+VanillaStacking <- function(X, y){
+  ## Constrained Ridge: sum to one + positive + no intercept + prior weights 
+  Z.mat <- as.matrix(X)
+  y.vec <- y
+  M <- ncol(Z.mat)
   weights <- rep(NA, M)
   tryCatch({
-    qp.model <- solve.QP(Dmat = Rinv, factorized = TRUE, dvec = d, Amat = C, bvec = b, meq = 1)
-    weights <- qp.model$solution
+    model <- ConstrRidge.priorw(X = Z.mat, y = y.vec, l1.seq = 10^seq(-3, 6, 0.1), wprior = rep(1/M, M))
+    weights <- model
   }, error = function(e){
-    cat("No solution for OPTW.SUM1POS!")
+    cat("No VanillaStacking!")
   })
   return(weights)
 }
 
-#################################################
-#### Zero-weight prior: regularized weights #####
-#################################################
-### Constrained Elastic Net Regression with Zero Weights as Prior 
-CalGCV.lasso <- function(X, y, lambda1){
-  ## gamma = 1
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  D <- rbind(cbind(XTX, -XTX), cbind(-XTX, XTX))
-  if(!is.positive.definite(D)){
-    D <- nearPD(D)$mat
-  }
-  A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-  b0 <- c(1, rep(0, 2*M))
-  d <- c(XTY, -XTY) - lambda1*rep(1, 2*M)
-  result <- solve.QP(D, d, A, b0, meq = 1)$solution
-  #result <- solve.QP(D, d, A, b0, meq = 1)$solution
-  weights <- result[1:M] - result[(M+1):(2*M)]
-  ## step 2: p(lambda1)
-  # remove zero weights
-  remove.index <- which(abs(weights) <= 10^(-8))
-  n0 <- length(remove.index)
-  if(n0 == 0){
-    invW <- diag(1/(2*abs(weights)))
-    B <- t(X)%*%X + lambda1*invW
-    BB <- X %*% solve(B) %*% t(X)
-    plambda <- sum(diag(BB)) - n0
-  }
-  else if(n0 >= M-1){
-    plambda <- M - length(remove.index)
-  }
-  else if(n0 > 0 && n0 < M-1){
-    invW <- diag(1/(2*abs(weights))[-remove.index])
-    B <- t(X[ , -remove.index])%*%X[ , -remove.index] + lambda1*invW
-    BB <- X[ , -remove.index] %*% solve(B) %*% t(X[ , -remove.index])
-    plambda <- sum(diag(BB)) - n0
-  }
-  ## step 3: GCV
-  GCV <- (t(y-X%*%weights) %*% (y-X%*%weights))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-CalGCV.ridge <- function(X, y, lambda2){
-  ## gamma = 2
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  mat <- cbind(XTX + lambda2*diag(M), rep(1, M))
-  mat <- rbind(mat, t(c(rep(1, M), 0)))
-  result <- solve(mat) %*% c(XTY, 1)
-  weights <- result[1:M]
-  ## step 2: p(lambda2)
-  B <- X %*% solve(t(X)%*%X + lambda2*diag(M)) %*% t(X)
-  plambda <- sum(diag(B))
-  ## step 3: GCV
-  GCV <- (t(y-X%*%weights) %*% (y-X%*%weights))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-CalGCV.enet <- function(X, y, lambda1, lambda2){
-  ## gamma = 1 & 2
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-  b0 <- c(1, rep(0, 2*M))
-  d <- c(XTY, -XTY) - lambda1*rep(1, 2*M)
-  D <- rbind(cbind(XTX + lambda2*diag(M), -XTX - lambda2*diag(M)), 
-             cbind(-XTX - lambda2*diag(M), XTX + lambda2*diag(M)))
-  if(!is.positive.definite(D)){
-    D <- nearPD(D)$mat
-  }
-  result <- solve.QP(D, d, A, b0, meq = 1)$solution
-  weights <- result[1:M] - result[(M+1):(2*M)]
-  ## step 2: p(lambda1, lambda2)
-  # remove zero weights
-  remove.index <- which(abs(weights) <= 10^(-8))
-  n0 <- length(remove.index)
-  if(n0 == 0){
-    invW1 <- diag(1/(2*abs(weights)))
-    B <- t(X)%*%X + lambda1*invW1 + lambda2*diag(M)
-    BB <- X %*% solve(B) %*% t(X)
-    plambda <- sum(diag(BB)) - n0
-  }
-  else if(n0 >= M-1){
-    plambda <- M - length(remove.index)
-  }
-  else if(n0 > 0 && n0 < M-1){
-    invW1 <- diag(1/(2*abs(weights))[-remove.index])
-    B <- t(X[ , -remove.index])%*%X[ , -remove.index] + lambda1*invW1 + lambda2*diag(M-n0)
-    BB <- X[ , -remove.index] %*% solve(B) %*% t(X[ , -remove.index])
-    plambda <- sum(diag(BB)) - n0
-  }
-  ## step 3: GCV
-  GCV <- (t(y-X%*%weights) %*% (y-X%*%weights))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-ConstrENetZERO <- function(X, y, addl1, addl2, l1.seq, l2.seq){
-  bestl1 <- NA
-  bestl2 <- NA
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  if(addl1 == FALSE && addl2 == FALSE){ 
-    #mat <- cbind(XTX, rep(1, M))
-    #mat <- rbind(mat, t(c(rep(1, M), 0)))
-    #if(!is.positive.definite(mat)){
-    #  mat <- nearPD(mat)$mat
-    #}
-    #result <- solve(mat) %*% c(XTY, 1)
-    #weights <- result[1:M]
-    weights <- optweight(Sigma = cov(X)*((n-1)/n), mux = colMeans(X), sigmaxy = cov(X, y))
-  } ### estimated optimal weights
-  else if (addl1 == TRUE && addl2 == FALSE){ 
-    gcv <- sapply(1:length(l1.seq), function(i) CalGCV.lasso(X, y, l1.seq[i]))
-    bestl1 <- l1.seq[which.min(gcv)]
-    D <- rbind(cbind(XTX, -XTX), cbind(-XTX, XTX))
-    if(!is.positive.definite(D)){
-      D <- nearPD(D)$mat
-    }
-    A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-    b0 <- c(1, rep(0, 2*M))
-    d <- c(XTY, -XTY) - bestl1*rep(1, 2*M)
-    result <- solve.QP(D, d, A, b0, meq = 1)$solution
-    weights <- result[1:M] - result[(M+1):(2*M)]
-  }### Lasso regression
-  else if (addl1 == FALSE && addl2 == TRUE){
-    gcv <- sapply(1:length(l2.seq), function(i) CalGCV.ridge(X, y, l2.seq[i]))
-    bestl2 <- l2.seq[which.min(gcv)]
-    mat <- cbind(XTX + bestl2*diag(M), rep(1, M))
-    mat <- rbind(mat, t(c(rep(1, M), 0)))
-    result <- solve(mat) %*% c(XTY, 1)
-    weights <- result[1:M]
-  } ### Ridge Regression 
-  else if (addl1 == TRUE && addl2 == TRUE){
-    lambda.set <- cbind(sort(rep(l1.seq, length(l2.seq))), rep(l2.seq, length(l1.seq)))
-    gcv <- sapply(1:(length(l1.seq)*length(l2.seq)), function(i) CalGCV.enet(X, y, lambda.set[i, 1], lambda.set[i, 2]))
-    bestl1 <- lambda.set[which.min(gcv), 1]
-    bestl2 <- lambda.set[which.min(gcv), 2]
-    A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-    b0 <- c(1, rep(0, 2*M))
-    d <- c(XTY, -XTY) - bestl1*rep(1, 2*M)
-    D <- rbind(cbind(XTX + bestl2*diag(M), -XTX - bestl2*diag(M)), 
-               cbind(-XTX - bestl2*diag(M), XTX + bestl2*diag(M)))
-    if(!is.positive.definite(D)){
-      D <- nearPD(D)$mat
-    }
-    result <- solve.QP(D, d, A, b0, meq = 1)$solution
-    weights <- result[1:M] - result[(M+1):(2*M)]
-  } ### Elastic Net regression 
-  return(list(weights = weights, bestl1 = bestl1, bestl2 = bestl2))
-}
 
-
-#################################################
-#### Equal-weight prior: regularized weights ####
-#################################################
-### Our Constrained Elastic Net Regression with Equal Weights as Prior 
-CalGCV.ourlasso <- function(X, y, lambda1, wprior){
-  ## gamma = 1
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  D <- rbind(cbind(XTX, -XTX), cbind(-XTX, XTX))
-  if(!is.positive.definite(D)){
-    D <- nearPD(D)$mat
-  }
-  A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-  b0 <- c(0, rep(0, 2*M)) # different part 
-  d <- c(XTY - XTX%*%wprior, -XTY + XTX%*%wprior) - lambda1*rep(1, 2*M) # different part 
-  result <- solve.QP(D, d, A, b0, meq = 1)$solution
-  v <- result[1:M] - result[(M+1):(2*M)]
-  ## step 2: p(lambda1)
-  # remove zero v
-  remove.index <- which(abs(v) <= 10^(-6))
-  n0 <- length(remove.index)
-  if(n0 == 0){
-    invW <- diag(1/(2*abs(v)))
-    B <- t(X)%*%X + lambda1*invW
-    BB <- X %*% solve(B) %*% t(X)
-    plambda <- sum(diag(BB)) - n0
-  }
-  else if(n0 >= M-1){
-    plambda <- M - length(remove.index)
-  }
-  else if(n0 > 0 && n0 < M-1){
-    invW <- diag(1/(2*abs(v))[-remove.index])
-    B <- t(X[ , -remove.index])%*%X[ , -remove.index] + lambda1*invW
-    BB <- X[ , -remove.index] %*% solve(B) %*% t(X[ , -remove.index])
-    plambda <- sum(diag(BB)) - n0
-  }
-  ## step 3: GCV
-  GCV <- (t(y-X%*%(v + wprior)) %*% (y-X%*%(v + wprior)))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-CalGCV.ourridge <- function(X, y, lambda2, wprior){
-  ## gamma = 2
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  mat <- cbind(XTX + lambda2*diag(M), rep(1, M))
-  mat <- rbind(mat, t(c(rep(1, M), 0)))
-  result <- solve(mat) %*% c(XTY - XTX%*%wprior, 0) # different part 
-  v <- result[1:M]  
-  ## step 2: p(lambda2)
-  B <- X %*% solve(t(X)%*%X + lambda2*diag(M)) %*% t(X)
-  plambda <- sum(diag(B))
-  ## step 3: GCV
-  GCV <- (t(y-X%*%(v + wprior)) %*% (y-X%*%(v + wprior)))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-CalGCV.ourenet <- function(X, y, lambda1, lambda2, wprior){
-  ## gamma = 1 & 2
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  ## step 1: calculate beta hat
-  A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-  b0 <- c(0, rep(0, 2*M)) # different part
-  d <- c(XTY - XTX%*%wprior, -XTY + XTX%*%wprior) - lambda1*rep(1, 2*M) # different part
-  D <- rbind(cbind(XTX + lambda2*diag(M), -XTX - lambda2*diag(M)), 
-             cbind(-XTX - lambda2*diag(M), XTX + lambda2*diag(M)))
-  if(!is.positive.definite(D)){
-    D <- nearPD(D)$mat
-  }
-  result <- solve.QP(D, d, A, b0, meq = 1)$solution
-  v <- result[1:M] - result[(M+1):(2*M)]
-  ## step 2: p(lambda1, lambda2)
-  # remove zero v
-  remove.index <- which(abs(v) <= 10^(-6))
-  n0 <- length(remove.index)
-  if(n0 == 0){
-    invW1 <- diag(1/(2*abs(v)))
-    B <- t(X)%*%X + lambda1*invW1 + lambda2*diag(M)
-    BB <- X %*% solve(B) %*% t(X)
-    plambda <- sum(diag(BB)) - n0
-  }
-  else if(n0 >= M-1){
-    plambda <- M - length(remove.index)
-  }
-  else if(n0 > 0 && n0 < M-1){
-    invW1 <- diag(1/(2*abs(v))[-remove.index])
-    B <- t(X[ , -remove.index])%*%X[ , -remove.index] + lambda1*invW1 + lambda2*diag(M-n0)
-    BB <- X[ , -remove.index] %*% solve(B) %*% t(X[ , -remove.index])
-    plambda <- sum(diag(BB)) - n0
-  }
-  ## step 3: GCV
-  GCV <- (t(y-X%*%(v + wprior)) %*% (y-X%*%(v + wprior)))/(n * (1 - plambda/n)^2)
-  return(GCV)
-}
-ConstrENetEQAUL <- function(X, y, addl1, addl2, l1.seq, l2.seq, wprior){
-  bestl1 <- NA
-  bestl2 <- NA
-  M <- ncol(X)
-  n <- nrow(X)
-  XTX <- t(X) %*% X
-  XTY <- t(X) %*% y
-  if(addl1 == FALSE && addl2 == FALSE){
-    #mat <- cbind(XTX, rep(1, M))
-    #mat <- rbind(mat, t(c(rep(1, M), 0)))
-    #if(!is.positive.definite(mat)){
-    #  mat <- nearPD(mat)$mat
-    #}
-    #result <- solve(mat) %*% c(XTY, 1)
-    #weights <- result[1:M]
-    weights <- optweight(Sigma = cov(X)*((n-1)/n), mux = colMeans(X), sigmaxy = cov(X, y))
-  } ## estimated optimal weights 
-  else if (addl1 == TRUE && addl2 == FALSE){
-    gcv <- sapply(1:length(l1.seq), function(i) CalGCV.ourlasso(X, y, l1.seq[i], wprior))
-    bestl1 <- l1.seq[which.min(gcv)]
-    D <- rbind(cbind(XTX, -XTX), cbind(-XTX, XTX))
-    if(!is.positive.definite(D)){
-      D <- nearPD(D)$mat
-    }
-    A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-    b0 <- c(0, rep(0, 2*M)) # different part 
-    d <- c(XTY - XTX%*%wprior, -XTY + XTX%*%wprior) - bestl1*rep(1, 2*M) # different part 
-    result <- solve.QP(D, d, A, b0, meq = 1)$solution
-    weights <- result[1:M] - result[(M+1):(2*M)] + wprior # different part
-  } ## our lasso regression 
-  else if (addl1 == FALSE && addl2 == TRUE){
-    gcv <- sapply(1:length(l2.seq), function(i) CalGCV.ourridge(X, y, l2.seq[i], wprior))
-    bestl2 <- l2.seq[which.min(gcv)]
-    mat <- cbind(XTX + bestl2*diag(M), rep(1, M))
-    mat <- rbind(mat, t(c(rep(1, M), 0)))
-    result <- solve(mat) %*% c(XTY-XTX%*%wprior, 0) # different part 
-    weights <- result[1:M] + wprior # different part 
-  } ## our ridge regression 
-  else if (addl1 == TRUE && addl2 == TRUE){
-    lambda.set <- cbind(sort(rep(l1.seq, length(l2.seq))), rep(l2.seq, length(l1.seq)))
-    gcv <- sapply(1:(length(l1.seq)*length(l2.seq)), function(i) CalGCV.ourenet(X, y, lambda.set[i, 1], lambda.set[i, 2], wprior))
-    bestl1 <- lambda.set[which.min(gcv), 1]
-    bestl2 <- lambda.set[which.min(gcv), 2]
-    A <- cbind(c(rep(1, M), rep(-1, M)), diag(2*M))
-    b0 <- c(0, rep(0, 2*M)) # different part
-    d <- c(XTY - XTX%*%wprior, -XTY + XTX%*%wprior) - bestl1*rep(1, 2*M) # different part
-    D <- rbind(cbind(XTX + bestl2*diag(M), -XTX - bestl2*diag(M)), 
-               cbind(-XTX - bestl2*diag(M), XTX + bestl2*diag(M)))
-    if(!is.positive.definite(D)){
-      D <- nearPD(D)$mat
-    }
-    result <- solve.QP(D, d, A, b0, meq = 1)$solution
-    weights <- result[1:M] - result[(M+1):(2*M)] + wprior # different part
-  }
-  return(list(weights = weights, bestl1 = bestl1, bestl2 = bestl2))
-}
 
 
 
