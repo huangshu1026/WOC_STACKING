@@ -2,7 +2,7 @@
 
 This repository contains R code for implementing algorithms, replicating simulations, tables and figures 
 described in the working paper "Combining the Aggregated Judgments: An Efficient Method for Improving Accuracy byStacking Multiple Weighting Models" 
-by Shu Huang, Stephen B. Broomell, and Russell Golman. 
+by Shu Huang, Russell Golman, and Stephen B. Broomell.
 
 ## How to use
 1. Clone this repository to your local computer
